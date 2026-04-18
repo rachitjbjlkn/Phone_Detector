@@ -13,7 +13,8 @@ import cv2
 import numpy as np
 import time
 import threading
-import pygame
+import base64
+import os
 from datetime import datetime
 from collections import deque
 from ultralytics import YOLO
@@ -56,16 +57,40 @@ if "objs"          not in st.session_state: st.session_state.objs          = []
 # Shared between thread and Streamlit (use a simple dict as a mutable container)
 _shared = st.session_state.setdefault("_shared", {
     "running":      False,
-    "frame":        None,          # latest annotated BGR frame
+    "frame":        None,
     "phone":        False,
     "fps":          0.0,
     "total":        0,
     "log":          deque(maxlen=60),
     "objs":         [],
     "last_beep":    0.0,
+    "play_sound":   False,   # set True by camera thread → consumed by UI loop
 })
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
+# ── Browser audio (plays in user's browser, works on Streamlit Cloud) ──────────
+@st.cache_resource
+def load_audio_b64(path):
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    return None
+
+def play_browser_sound(audio_b64, volume=0.8):
+    """Inject a hidden autoplay <audio> tag — plays in the visitor's browser."""
+    if not audio_b64:
+        return
+    vol_js = f"a.volume={volume:.2f};"
+    st.markdown(f"""
+        <audio id="beep" autoplay style="display:none">
+          <source src="data:audio/mp3;base64,{audio_b64}" type="audio/mpeg">
+        </audio>
+        <script>
+          var a = document.getElementById('beep');
+          if(a){{ {vol_js} a.play(); }}
+        </script>
+    """, unsafe_allow_html=True)
+
+# ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⚙️ CONFIG")
     st.markdown('<div class="sl"></div>', unsafe_allow_html=True)
@@ -78,7 +103,7 @@ with st.sidebar:
     st.markdown('<div class="sl"></div>', unsafe_allow_html=True)
     st.markdown("## 🔊 AUDIO")
     audio_on   = st.toggle("Enable Alert", value=True)
-    audio_file = st.text_input("Audio File", value="alert.mp3")
+    audio_file = st.text_input("Audio File", value="phone.mp3")
     cooldown   = st.slider("Cooldown (s)", 0.5, 10.0, 2.0, 0.5)
     vol        = st.slider("Volume", 0.0, 1.0, 0.8, 0.05)
 
@@ -107,18 +132,8 @@ def load_model(name):
     return YOLO(name)
 
 # ── Audio ──────────────────────────────────────────────────────────────────────
-def play_sound(shared, file, volume, cooldown):
-    now = time.time()
-    if now - shared["last_beep"] < cooldown:
-        return
-    shared["last_beep"] = now
-    try:
-        pygame.mixer.init(44100,-16,2,512)
-        snd = pygame.mixer.Sound(file)
-        snd.set_volume(volume)
-        snd.play()
-    except Exception:
-        pass
+# Sound is triggered by setting shared["play_sound"] = True in the camera thread.
+# The main Streamlit loop checks this flag and injects the browser <audio> tag.
 
 # ── Camera thread ──────────────────────────────────────────────────────────────
 def camera_loop(shared, model, watch, conf_thresh, cam_index,
@@ -181,10 +196,12 @@ def camera_loop(shared, model, watch, conf_thresh, cam_index,
             cv2.addWeighted(ov,0.55,frame,0.45,0,frame)
             cv2.putText(frame,"! PHONE DETECTED",(14,36),
                         cv2.FONT_HERSHEY_DUPLEX,1.0,(255,255,255),2,cv2.LINE_AA)
+            # Signal the UI to play sound (with cooldown)
             if audio_on:
-                threading.Thread(target=play_sound,
-                                 args=(shared,audio_file,vol,cooldown),
-                                 daemon=True).start()
+                now = time.time()
+                if now - shared["last_beep"] >= cooldown:
+                    shared["last_beep"] = now
+                    shared["play_sound"] = True
         else:
             shared["phone"] = False
 
@@ -226,6 +243,12 @@ if stop_clicked:
 if clear_clicked:
     _shared["log"].clear()
     _shared["total"] = 0
+
+# ── Audio playback (browser-side) ──────────────────────────────────────────────
+_audio_b64 = load_audio_b64(audio_file)
+if _shared.get("play_sound") and audio_on:
+    _shared["play_sound"] = False
+    play_browser_sound(_audio_b64, volume=vol)
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 st.markdown('<p class="title">◈ PHONE DETECTION SYSTEM</p>', unsafe_allow_html=True)
